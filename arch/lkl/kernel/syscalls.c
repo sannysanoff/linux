@@ -97,7 +97,7 @@ static void del_host_task(void *arg)
 
 	switch_to_host_task(task);
 	host_task_id--;
-	set_ti_thread_flag(ti, TIF_SCHED_JB);
+	set_ti_thread_flag(ti, TIF_HOST_EXIT);
 	lkl_ops->jmp_buf_set(&ti->sched_jb, exit_task);
 }
 

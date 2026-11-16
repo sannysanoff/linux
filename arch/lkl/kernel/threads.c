@@ -91,6 +91,7 @@ struct task_struct *__switch_to(struct task_struct *prev,
 	struct thread_info *_next = task_thread_info(next);
 	unsigned long _prev_flags = _prev->flags;
 	struct lkl_jmp_buf _prev_jb;
+	bool use_jb;
 
 	_current_thread_info = task_thread_info(next);
 	_next->prev_sched = prev;
@@ -99,14 +100,24 @@ struct task_struct *__switch_to(struct task_struct *prev,
 	BUG_ON(!_next->tid);
 	lkl_cpu_change_owner(_next->tid);
 
-	if (test_bit(TIF_SCHED_JB, &_prev_flags)) {
+	/* A dying host thread inside del_host_task() runs do_exit(0), which may
+	 * yield (e.g. cond_resched in d_invalidate during namespace/fs teardown)
+	 * before reaching do_task_dead(). Only longjmp back to the pthread when
+	 * prev is actually TASK_DEAD; earlier reschedules must block and resume
+	 * so do_exit() finishes instead of abandoning LKL CPU ownership.
+	 */
+	use_jb = test_bit(TIF_SCHED_JB, &_prev_flags) ||
+		 (test_bit(TIF_HOST_EXIT, &_prev_flags) &&
+		  READ_ONCE(prev->__state) == TASK_DEAD);
+	if (use_jb) {
 		/* Atomic. Must be done before wakeup next */
 		clear_ti_thread_flag(_prev, TIF_SCHED_JB);
+		clear_ti_thread_flag(_prev, TIF_HOST_EXIT);
 		_prev_jb = _prev->sched_jb;
 	}
 
 	lkl_ops->sem_up(_next->sched_sem);
-	if (test_bit(TIF_SCHED_JB, &_prev_flags)) {
+	if (use_jb) {
 		lkl_ops->jmp_buf_longjmp(&_prev_jb, 1);
 	} else {
 		lkl_ops->sem_down(_prev->sched_sem);
