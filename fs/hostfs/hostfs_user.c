@@ -16,6 +16,7 @@
 #include <sys/vfs.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
+#include <sys/xattr.h>
 #include "hostfs.h"
 #include <utime.h>
 
@@ -44,6 +45,50 @@ static void stat64_to_hostfs(const struct stat64 *buf, struct hostfs_stat *p)
 	p->dev.min = minor(buf->st_dev);
 }
 
+/*
+ * Virtual ownership. The host process cannot chown to any uid but its own, yet
+ * images and containers expect root-owned and service-owned files (postgres
+ * chowns its run directory, layers carry uid 999 trees). The wanted owner is
+ * kept in the user.kbox.owner xattr as "uid:gid" and reported by stat instead
+ * of the real host owner. A file owned by the hosting uid needs no xattr.
+ */
+#define HOSTFS_OWNER_XATTR "user.kbox.owner"
+
+static int owner_read(const char *path, int fd, unsigned *uid, unsigned *gid)
+{
+	char buf[48];
+	ssize_t n;
+
+	if (fd >= 0)
+		n = fgetxattr(fd, HOSTFS_OWNER_XATTR, buf, sizeof(buf) - 1);
+	else
+		n = lgetxattr(path, HOSTFS_OWNER_XATTR, buf, sizeof(buf) - 1);
+	if (n <= 0)
+		return 0;
+	buf[n] = 0;
+	return sscanf(buf, "%u:%u", uid, gid) == 2;
+}
+
+static int owner_write(const char *path, int fd, unsigned uid, unsigned gid)
+{
+	char buf[48];
+	int n, rc;
+
+	if (uid == (unsigned) getuid() && gid == (unsigned) getgid()) {
+		if (fd >= 0)
+			rc = fremovexattr(fd, HOSTFS_OWNER_XATTR);
+		else
+			rc = lremovexattr(path, HOSTFS_OWNER_XATTR);
+		return (rc < 0 && errno != ENODATA) ? -errno : 0;
+	}
+	n = snprintf(buf, sizeof(buf), "%u:%u", uid, gid);
+	if (fd >= 0)
+		rc = fsetxattr(fd, HOSTFS_OWNER_XATTR, buf, n, 0);
+	else
+		rc = lsetxattr(path, HOSTFS_OWNER_XATTR, buf, n, 0);
+	return rc < 0 ? -errno : 0;
+}
+
 int stat_file(const char *path, struct hostfs_stat *p, int fd)
 {
 	struct stat64 buf;
@@ -55,6 +100,14 @@ int stat_file(const char *path, struct hostfs_stat *p, int fd)
 		return -errno;
 	}
 	stat64_to_hostfs(&buf, p);
+	{
+		unsigned uid, gid;
+
+		if (owner_read(path, fd, &uid, &gid)) {
+			p->uid = uid;
+			p->gid = gid;
+		}
+	}
 	return 0;
 }
 
@@ -211,21 +264,17 @@ int set_attr(const char *file, struct hostfs_iattr *attrs, int fd)
 			return -errno;
 		}
 	}
-	if (attrs->ia_valid & HOSTFS_ATTR_UID) {
-		if (fd >= 0) {
-			if (fchown(fd, attrs->ia_uid, -1))
-				return -errno;
-		} else if (chown(file, attrs->ia_uid, -1)) {
-			return -errno;
-		}
-	}
-	if (attrs->ia_valid & HOSTFS_ATTR_GID) {
-		if (fd >= 0) {
-			if (fchown(fd, -1, attrs->ia_gid))
-				return -errno;
-		} else if (chown(file, -1, attrs->ia_gid)) {
-			return -errno;
-		}
+	if (attrs->ia_valid & (HOSTFS_ATTR_UID | HOSTFS_ATTR_GID)) {
+		unsigned uid = (unsigned) getuid(), gid = (unsigned) getgid();
+
+		owner_read(file, fd, &uid, &gid);
+		if (attrs->ia_valid & HOSTFS_ATTR_UID)
+			uid = attrs->ia_uid;
+		if (attrs->ia_valid & HOSTFS_ATTR_GID)
+			gid = attrs->ia_gid;
+		err = owner_write(file, fd, uid, gid);
+		if (err)
+			return err;
 	}
 	if (attrs->ia_valid & HOSTFS_ATTR_SIZE) {
 		if (fd >= 0) {
