@@ -507,6 +507,17 @@ static int ovl_get_upper(struct super_block *sb, struct ovl_fs *ofs,
 	upper_layer->fsid = 0;
 
 	/*
+	 * With userxattr a whiteout in the upper layer is a zero-size regular
+	 * file carrying user.overlay.whiteout, because unprivileged mounts
+	 * cannot create the 0/0 char device. Lookups already treat it as a
+	 * whiteout; mark the layer so readdir probes upper entries for the
+	 * xattr as well, otherwise a deleted file stays visible in a listing
+	 * and removing a merged directory fails with -ENOTEMPTY.
+	 */
+	if (ofs->config.userxattr)
+		ovl_layer_set_xwhiteouts(ofs, upper_layer);
+
+	/*
 	 * Inherit SB_NOSEC flag from upperdir.
 	 *
 	 * This optimization changes behavior when a security related attribute

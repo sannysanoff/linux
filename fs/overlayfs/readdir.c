@@ -363,7 +363,8 @@ static int ovl_dir_read_merged(struct dentry *dentry, struct list_head *list,
 		next = ovl_path_next(idx, dentry, &realpath, &layer);
 		rdd.is_upper = ovl_dentry_upper(dentry) == realpath.dentry;
 		rdd.in_xwhiteouts_dir = layer->has_xwhiteouts &&
-					ovl_dentry_has_xwhiteouts(dentry);
+					(rdd.is_upper ||
+					 ovl_dentry_has_xwhiteouts(dentry));
 
 		if (next != -1) {
 			err = ovl_dir_read(&realpath, &rdd);
@@ -978,6 +979,40 @@ const struct file_operations ovl_dir_operations = {
 	.release	= ovl_dir_release,
 };
 
+/*
+ * In userxattr mode a whiteout is a zero-size regular file carrying
+ * user.overlay.whiteout, created so an unprivileged mount can delete a lower
+ * entry without mknod. ovl_iterate() resolves such an entry on demand, but
+ * ovl_check_empty_dir() decides emptiness from the merged list before any
+ * iteration, so it has to resolve the entries of the upper layer itself.
+ */
+static void ovl_resolve_upper_xwhiteouts(struct ovl_fs *ofs,
+					 struct dentry *dentry,
+					 struct list_head *list)
+{
+	struct dentry *upper = ovl_dentry_upper(dentry);
+	struct ovl_cache_entry *p;
+
+	if (!ofs->config.userxattr || !upper || !d_inode(upper))
+		return;
+
+	list_for_each_entry(p, list, l_node) {
+		struct dentry *this;
+		struct path path = {
+			.mnt = ovl_upper_mnt(ofs),
+		};
+
+		if (!p->is_upper || !p->check_xwhiteout || p->is_whiteout)
+			continue;
+		this = lookup_one_len_unlocked(p->name, upper, p->len);
+		if (IS_ERR(this))
+			continue;
+		path.dentry = this;
+		p->is_whiteout = ovl_path_is_whiteout(ofs, &path);
+		dput(this);
+	}
+}
+
 int ovl_check_empty_dir(struct dentry *dentry, struct list_head *list)
 {
 	int err;
@@ -990,6 +1025,8 @@ int ovl_check_empty_dir(struct dentry *dentry, struct list_head *list)
 	revert_creds(old_cred);
 	if (err)
 		return err;
+
+	ovl_resolve_upper_xwhiteouts(OVL_FS(dentry->d_sb), dentry, list);
 
 	err = 0;
 
