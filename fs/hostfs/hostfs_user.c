@@ -15,8 +15,12 @@
 #include <sys/types.h>
 #include <sys/vfs.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
 #include "hostfs.h"
 #include <utime.h>
+
+/* panic() lives in the kernel, which is linked into the same process. */
+extern void panic(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
 static void stat64_to_hostfs(const struct stat64 *buf, struct hostfs_stat *p)
 {
@@ -34,10 +38,10 @@ static void stat64_to_hostfs(const struct stat64 *buf, struct hostfs_stat *p)
 	p->mtime.tv_nsec = 0;
 	p->blksize = buf->st_blksize;
 	p->blocks = buf->st_blocks;
-	p->rdev.maj = os_major(buf->st_rdev);
-	p->rdev.min = os_minor(buf->st_rdev);
-	p->dev.maj = os_major(buf->st_dev);
-	p->dev.min = os_minor(buf->st_dev);
+	p->rdev.maj = major(buf->st_rdev);
+	p->rdev.min = minor(buf->st_rdev);
+	p->dev.maj = major(buf->st_dev);
+	p->dev.min = minor(buf->st_dev);
 }
 
 int stat_file(const char *path, struct hostfs_stat *p, int fd)
@@ -320,7 +324,7 @@ int do_mknod(const char *file, int mode, unsigned int major, unsigned int minor)
 {
 	int err;
 
-	err = mknod(file, mode, os_makedev(major, minor));
+	err = mknod(file, mode, makedev(major, minor));
 	if (err)
 		return -errno;
 	return 0;
@@ -332,6 +336,184 @@ int link_file(const char *to, const char *from)
 
 	err = link(to, from);
 	if (err)
+		return -errno;
+	return 0;
+}
+
+/*
+ * Extended attributes. l*xattr follows the host symlink policy of the rest of
+ * hostfs: the guest resolves symlinks itself, so the host call must not.
+ */
+int hostfs_getxattr(const char *path, const char *name, void *value,
+		    size_t size)
+{
+	ssize_t n = lgetxattr(path, name, value, size);
+
+	if (n < 0)
+		return -errno;
+	return (int) n;
+}
+
+int hostfs_setxattr(const char *path, const char *name, const void *value,
+		    size_t size, int flags)
+{
+	if (lsetxattr(path, name, value, size, flags) < 0)
+		return -errno;
+	return 0;
+}
+
+int hostfs_listxattr(const char *path, char *list, size_t size)
+{
+	ssize_t n = llistxattr(path, list, size);
+
+	if (n < 0)
+		return -errno;
+	return (int) n;
+}
+
+int hostfs_fgetxattr(int fd, const char *name, void *value, size_t size)
+{
+	ssize_t n = fgetxattr(fd, name, value, size);
+
+	if (n < 0)
+		return -errno;
+	return (int) n;
+}
+
+int hostfs_fsetxattr(int fd, const char *name, const void *value, size_t size,
+		     int flags)
+{
+	if (fsetxattr(fd, name, value, size, flags) < 0)
+		return -errno;
+	return 0;
+}
+
+int hostfs_flistxattr(int fd, char *list, size_t size)
+{
+	ssize_t n = flistxattr(fd, list, size);
+
+	if (n < 0)
+		return -errno;
+	return (int) n;
+}
+
+int hostfs_fremovexattr(int fd, const char *name)
+{
+	if (fremovexattr(fd, name) < 0)
+		return -errno;
+	return 0;
+}
+
+int hostfs_removexattr(const char *path, const char *name)
+{
+	if (lremovexattr(path, name) < 0)
+		return -errno;
+	return 0;
+}
+
+/*
+ * fallocate / copy_file_range / tmpfile: pure passthroughs onto the host file
+ * descriptor. They are the reason hostfs can serve as an overlay upper: the
+ * host does the allocation and the range copy, the guest only forwards.
+ */
+int hostfs_fallocate(int fd, int mode, long long offset, long long len)
+{
+	if (fallocate(fd, mode, (off_t) offset, (off_t) len) < 0)
+		return -errno;
+	return 0;
+}
+
+long long hostfs_copy_range(int fd_in, long long *off_in, int fd_out,
+			    long long *off_out, unsigned long long len,
+			    unsigned int flags)
+{
+	ssize_t n;
+
+	n = copy_file_range(fd_in, (loff_t *) off_in, fd_out,
+			    (loff_t *) off_out, (size_t) len, flags);
+	if (n < 0)
+		return -errno;
+	return n;
+}
+
+int hostfs_tmpfile_open(const char *dir, int mode)
+{
+	int fd = open(dir, O_TMPFILE | O_RDWR, mode & 07777);
+
+	if (fd < 0)
+		return -errno;
+	return fd;
+}
+
+/*
+ * Whiteout emulation. overlayfs marks a deleted entry with a character device
+ * 0:0, which the hosting process cannot create on the host (mknod needs
+ * CAP_MKNOD, and an unprivileged pod has no capabilities). The same marker can
+ * be carried by an xattr on an empty regular file, which is what fuse-overlayfs
+ * does; hostfs reports such a file back as device 0:0 so overlayfs sees a
+ * whiteout, and creates it that way when asked for one.
+ */
+#define HOSTFS_WHITEOUT_XATTR "user.overlay.whiteout"
+
+/*
+ * Ownership mapping. Every hostfs operation runs as the process that hosts the
+ * kernel, so files it creates belong to that uid on the host. Inside the guest
+ * the same files must look like the caller's (guest root in a container),
+ * otherwise a container cannot write what it just created. Report the hosting
+ * uid as guest 0 and translate back on chown.
+ */
+unsigned hostfs_host_uid(void)
+{
+	return (unsigned) getuid();
+}
+
+unsigned hostfs_host_gid(void)
+{
+	return (unsigned) getgid();
+}
+
+unsigned hostfs_guest_uid(unsigned host_uid)
+{
+	return host_uid == hostfs_host_uid() ? 0 : host_uid;
+}
+
+unsigned hostfs_guest_gid(unsigned host_gid)
+{
+	return host_gid == hostfs_host_gid() ? 0 : host_gid;
+}
+
+int hostfs_whiteout_create(const char *path)
+{
+	int fd = open(path, O_CREAT | O_WRONLY | O_EXCL, 0600);
+	int err;
+
+	if (fd < 0) {
+		if (errno != EEXIST)
+			return -errno;
+		fd = open(path, O_WRONLY);
+		if (fd < 0)
+			return -errno;
+	}
+	err = fsetxattr(fd, HOSTFS_WHITEOUT_XATTR, "y", 1, 0);
+	close(fd);
+	return err < 0 ? -errno : 0;
+}
+
+int hostfs_is_whiteout(const char *path)
+{
+	char v;
+
+	if (lgetxattr(path, HOSTFS_WHITEOUT_XATTR, &v, sizeof(v)) != 1)
+		return 0;
+	return v == 'y';
+}
+
+int hostfs_link_fd(int fd, const char *target)
+{
+	char proc[64];
+
+	snprintf(proc, sizeof(proc), "/proc/self/fd/%d", fd);
+	if (linkat(AT_FDCWD, proc, AT_FDCWD, target, AT_SYMLINK_FOLLOW) < 0)
 		return -errno;
 	return 0;
 }

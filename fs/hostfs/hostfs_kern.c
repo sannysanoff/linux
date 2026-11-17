@@ -19,9 +19,13 @@
 #include <linux/fs_context.h>
 #include <linux/fs_parser.h>
 #include <linux/namei.h>
+#include <linux/xattr.h>
+#include <linux/falloc.h>
 #include "hostfs.h"
+#ifndef CONFIG_LKL
 #include <init.h>
 #include <kern.h>
+#endif
 
 struct hostfs_fs_info {
 	char *host_root_path;
@@ -52,7 +56,7 @@ static const struct inode_operations hostfs_iops;
 static const struct inode_operations hostfs_dir_iops;
 static const struct inode_operations hostfs_link_iops;
 
-#ifndef MODULE
+#if !defined(MODULE) && !defined(CONFIG_LKL)
 static int __init hostfs_args(char *options, int *add)
 {
 	char *ptr;
@@ -389,6 +393,94 @@ static int hostfs_fsync(struct file *file, loff_t start, loff_t end,
 	return ret;
 }
 
+/*
+ * fallocate and copy_file_range are forwarded to the host file. Both need a
+ * host fd; the inode keeps one for as long as the file is open, and otherwise
+ * a temporary descriptor is opened for the duration of the call.
+ */
+static int hostfs_host_fd(struct inode *inode, struct dentry *dentry, int w)
+{
+	char *name;
+	int fd;
+
+	if (HOSTFS_I(inode)->fd != -1)
+		return HOSTFS_I(inode)->fd;
+	name = dentry_name(dentry);
+	if (name == NULL)
+		return -ENOMEM;
+	fd = open_file(name, w ? 0 : 1, w ? 1 : 0, 0);
+	__putname(name);
+	return fd;
+}
+
+static int hostfs_release_temp_fd(struct inode *inode, int fd)
+{
+	if (fd >= 0 && fd != HOSTFS_I(inode)->fd) {
+		close_file(&fd);
+		return 1;
+	}
+	return 0;
+}
+
+static long hostfs_file_fallocate(struct file *file, int mode, loff_t offset,
+				  loff_t len)
+{
+	struct inode *inode = file_inode(file);
+	unsigned int cmd = mode & FALLOC_FL_PUNCH_HOLE;
+	int fd, err;
+
+	if (mode & ~FALLOC_FL_MODE_MASK)
+		return -EOPNOTSUPP;
+	if ((cmd == FALLOC_FL_PUNCH_HOLE) && !(mode & FALLOC_FL_KEEP_SIZE))
+		return -EOPNOTSUPP;
+
+	fd = hostfs_host_fd(inode, file_dentry(file), 1);
+	if (fd < 0)
+		return fd;
+	err = hostfs_fallocate(fd, mode, offset, len);
+	if (hostfs_release_temp_fd(inode, fd))
+		return err;
+	if (err == 0)
+		file_update_time(file);
+	return err;
+}
+
+static ssize_t hostfs_copy_file_range(struct file *file_in, loff_t pos_in,
+				      struct file *file_out, loff_t pos_out,
+				      size_t len, unsigned int flags)
+{
+	struct inode *inode_in = file_inode(file_in);
+	struct inode *inode_out = file_inode(file_out);
+	long long in_off = pos_in, out_off = pos_out;
+	int fdin, fdout, rfdin, rfdout;
+	long long n;
+
+	if (flags)
+		return -EINVAL;
+
+	fdin = hostfs_host_fd(inode_in, file_dentry(file_in), 0);
+	if (fdin < 0)
+		return fdin;
+	fdout = hostfs_host_fd(inode_out, file_dentry(file_out), 1);
+	if (fdout < 0) {
+		hostfs_release_temp_fd(inode_in, fdin);
+		return fdout;
+	}
+
+	n = hostfs_copy_range(fdin, &in_off, fdout, &out_off, len, flags);
+	rfdin = hostfs_release_temp_fd(inode_in, fdin);
+	rfdout = hostfs_release_temp_fd(inode_out, fdout);
+	(void) rfdin;
+
+	if (n > 0) {
+		i_size_write(inode_out, max_t(loff_t, i_size_read(inode_out),
+					      out_off));
+		if (!rfdout)
+			file_update_time(file_out);
+	}
+	return n;
+}
+
 static const struct file_operations hostfs_file_fops = {
 	.llseek		= generic_file_llseek,
 	.splice_read	= filemap_splice_read,
@@ -397,8 +489,10 @@ static const struct file_operations hostfs_file_fops = {
 	.write_iter	= generic_file_write_iter,
 	.mmap		= generic_file_mmap,
 	.open		= hostfs_open,
-	.release	= hostfs_file_release,
 	.fsync		= hostfs_fsync,
+	.fallocate	= hostfs_file_fallocate,
+	.copy_file_range = hostfs_copy_file_range,
+	.release	= hostfs_file_release,
 };
 
 static const struct file_operations hostfs_dir_fops = {
@@ -515,8 +609,8 @@ static const struct address_space_operations hostfs_aops = {
 static int hostfs_inode_update(struct inode *ino, const struct hostfs_stat *st)
 {
 	set_nlink(ino, st->nlink);
-	i_uid_write(ino, st->uid);
-	i_gid_write(ino, st->gid);
+	i_uid_write(ino, hostfs_guest_uid(st->uid));
+	i_gid_write(ino, hostfs_guest_gid(st->gid));
 	inode_set_atime_to_ts(ino, (struct timespec64){
 			st->atime.tv_sec,
 			st->atime.tv_nsec,
@@ -578,6 +672,21 @@ static int hostfs_inode_test(struct inode *inode, void *data)
 	return inode->i_ino == st->ino && HOSTFS_I(inode)->dev == dev;
 }
 
+/* Report a whiteout marker (an empty file carrying HOSTFS_WHITEOUT_XATTR) as
+ * what overlayfs expects to see: a character device 0:0. */
+static void hostfs_apply_whiteout(const char *name, struct hostfs_stat *st)
+{
+	if (!S_ISREG(st->mode) || st->size != 0)
+		return;
+	if (!hostfs_is_whiteout(name))
+		return;
+
+	st->mode = S_IFCHR;
+	st->rdev.maj = 0;
+	st->rdev.min = 0;
+	st->nlink = 1;
+}
+
 static struct inode *hostfs_iget(struct super_block *sb, char *name)
 {
 	struct inode *inode;
@@ -587,12 +696,15 @@ static struct inode *hostfs_iget(struct super_block *sb, char *name)
 	if (err)
 		return ERR_PTR(err);
 
+	hostfs_apply_whiteout(name, &st);
+
 	inode = iget5_locked(sb, st.ino, hostfs_inode_test, hostfs_inode_set,
 			     &st);
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
 
 	if (inode->i_state & I_NEW) {
+		inode->i_opflags |= IOP_XATTR;
 		unlock_new_inode(inode);
 	} else {
 		spin_lock(&inode->i_lock);
@@ -649,6 +761,62 @@ static struct dentry *hostfs_lookup(struct inode *ino, struct dentry *dentry,
 	return d_splice_alias(inode, dentry);
 }
 
+/*
+ * O_TMPFILE support: create the file anonymously on the host and remember its
+ * descriptor, then materialise it on link() through /proc/self/fd. The pod runs
+ * unprivileged, so linkat(AT_EMPTY_PATH) with CAP_DAC_READ_SEARCH is not an
+ * option; following the /proc fd entry needs no capability.
+ */
+static int hostfs_tmpfile(struct mnt_idmap *idmap, struct inode *dir,
+			  struct file *file, umode_t mode)
+{
+	struct inode *inode;
+	char *name;
+	int fd;
+
+	name = dentry_name(file->f_path.dentry);
+	if (name == NULL)
+		return -ENOMEM;
+	fd = hostfs_tmpfile_open(name, mode);
+	__putname(name);
+	if (fd < 0)
+		return fd;
+
+	inode = new_inode(dir->i_sb);
+	if (inode == NULL) {
+		close_file(&fd);
+		return -ENOMEM;
+	}
+
+	inode->i_mode = mode;
+	inode->i_op = &hostfs_iops;
+	inode->i_fop = &hostfs_file_fops;
+	inode->i_mapping->a_ops = &hostfs_aops;
+	HOSTFS_I(inode)->fd = fd;
+	HOSTFS_I(inode)->mode = FMODE_READ | FMODE_WRITE;
+	inode->i_size = 0;
+	d_tmpfile(file, inode);
+	unlock_new_inode(inode);
+	return finish_open_simple(file, 0);
+}
+
+/* Instantiate a freshly created host entry into its (negative) dentry. */
+static int hostfs_iget_instantiate(struct inode *dir, struct dentry *dentry)
+{
+	struct inode *inode;
+	char *name = dentry_name(dentry);
+	int err;
+
+	if (name == NULL)
+		return -ENOMEM;
+	inode = hostfs_iget(dir->i_sb, name);
+	__putname(name);
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+	d_instantiate(dentry, inode);
+	return 0;
+}
+
 static int hostfs_link(struct dentry *to, struct inode *ino,
 		       struct dentry *from)
 {
@@ -657,12 +825,32 @@ static int hostfs_link(struct dentry *to, struct inode *ino,
 
 	if ((from_name = dentry_name(from)) == NULL)
 		return -ENOMEM;
+
+	/* A dentry created by hostfs_tmpfile has no host path of its own; link
+	 * the anonymous host file through its descriptor instead. */
+	if (d_is_positive(to) && d_unhashed(to) &&
+	    HOSTFS_I(d_inode(to))->fd != -1) {
+		int fd = HOSTFS_I(d_inode(to))->fd;
+
+		err = hostfs_link_fd(fd, from_name);
+		__putname(from_name);
+		if (err)
+			return err;
+		return hostfs_iget_instantiate(d_inode(to), from);
+	}
+
 	to_name = dentry_name(to);
 	if (to_name == NULL) {
 		__putname(from_name);
 		return -ENOMEM;
 	}
 	err = link_file(to_name, from_name);
+	if (err) {
+		__putname(from_name);
+		__putname(to_name);
+		return err;
+	}
+	err = hostfs_iget_instantiate(ino, from);
 	__putname(from_name);
 	__putname(to_name);
 	return err;
@@ -690,24 +878,49 @@ static int hostfs_symlink(struct mnt_idmap *idmap, struct inode *ino,
 	char *file;
 	int err;
 
+	struct inode *inode;
+
 	if ((file = dentry_name(dentry)) == NULL)
 		return -ENOMEM;
 	err = make_symlink(file, to);
+	if (err) {
+		__putname(file);
+		return err;
+	}
+
+	inode = hostfs_iget(ino->i_sb, file);
 	__putname(file);
-	return err;
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+
+	d_instantiate(dentry, inode);
+	return 0;
 }
 
 static int hostfs_mkdir(struct mnt_idmap *idmap, struct inode *ino,
 			struct dentry *dentry, umode_t mode)
 {
+	struct inode *inode;
 	char *file;
 	int err;
 
 	if ((file = dentry_name(dentry)) == NULL)
 		return -ENOMEM;
-	err = do_mkdir(file, mode);
+	/* overlayfs passes S_IFDIR in ia_mode when it creates its work
+	 * directory; the host mkdir(2) rejects type bits with EINVAL. */
+	err = do_mkdir(file, (mode & 07777) | S_IRWXU);
+	if (err) {
+		__putname(file);
+		return err;
+	}
+
+	inode = hostfs_iget(ino->i_sb, file);
 	__putname(file);
-	return err;
+	if (IS_ERR(inode))
+		return PTR_ERR(inode);
+
+	d_instantiate(dentry, inode);
+	return 0;
 }
 
 static int hostfs_rmdir(struct inode *ino, struct dentry *dentry)
@@ -733,7 +946,10 @@ static int hostfs_mknod(struct mnt_idmap *idmap, struct inode *dir,
 	if (name == NULL)
 		return -ENOMEM;
 
-	err = do_mknod(name, mode, MAJOR(dev), MINOR(dev));
+	if ((mode & S_IFMT) == S_IFCHR && MAJOR(dev) == 0 && MINOR(dev) == 0)
+		err = hostfs_whiteout_create(name);
+	else
+		err = do_mknod(name, mode, MAJOR(dev), MINOR(dev));
 	if (err) {
 		__putname(name);
 		return err;
@@ -759,6 +975,31 @@ static int hostfs_rename2(struct mnt_idmap *idmap,
 	if (flags & ~(RENAME_NOREPLACE | RENAME_EXCHANGE))
 		return -EINVAL;
 
+	/* A tmpfile has no host path: materialise it at the new name instead of
+	 * renaming something that does not exist on the host. overlayfs ends
+	 * every copy-up this way. */
+	{
+		char *on = dentry_name(old_dentry);
+		char *nn = dentry_name(new_dentry);
+		if (on)
+			__putname(on);
+		if (nn)
+			__putname(nn);
+	}
+	if (d_is_positive(old_dentry) && d_unhashed(old_dentry) &&
+	    HOSTFS_I(d_inode(old_dentry))->fd != -1) {
+		char *name = dentry_name(new_dentry);
+		int err;
+
+		if (name == NULL)
+			return -ENOMEM;
+		err = hostfs_link_fd(HOSTFS_I(d_inode(old_dentry))->fd, name);
+		__putname(name);
+		if (err)
+			return err;
+		return hostfs_iget_instantiate(new_dir, new_dentry);
+	}
+
 	old_name = dentry_name(old_dentry);
 	if (old_name == NULL)
 		return -ENOMEM;
@@ -777,6 +1018,43 @@ static int hostfs_rename2(struct mnt_idmap *idmap,
 	return err;
 }
 
+/*
+ * Attributes are a passthrough too: re-read them from the host instead of
+ * trusting the values cached at lookup time. Without this, a file created or
+ * replaced on the host between two stats stays invisible in the guest, which
+ * matters when the same directory is shared with the pod's own tooling.
+ */
+static int hostfs_getattr(struct mnt_idmap *idmap, const struct path *path,
+			  struct kstat *stat, u32 request_mask,
+			  unsigned int query_flags)
+{
+	struct inode *inode = d_inode(path->dentry);
+	struct hostfs_stat st;
+	char *name;
+	int err;
+
+	if (HOSTFS_I(inode)->fd != -1) {
+		err = stat_file(NULL, &st, HOSTFS_I(inode)->fd);
+	} else {
+		name = dentry_name(path->dentry);
+		if (name == NULL)
+			return -ENOMEM;
+		err = stat_file(name, &st, -1);
+		if (err == 0)
+			hostfs_apply_whiteout(name, &st);
+		__putname(name);
+	}
+	if (err)
+		return err;
+
+	spin_lock(&inode->i_lock);
+	hostfs_inode_update(inode, &st);
+	spin_unlock(&inode->i_lock);
+
+	generic_fillattr(&nop_mnt_idmap, request_mask, inode, stat);
+	return 0;
+}
+
 static int hostfs_permission(struct mnt_idmap *idmap,
 			     struct inode *ino, int desired)
 {
@@ -789,18 +1067,19 @@ static int hostfs_permission(struct mnt_idmap *idmap,
 	if (desired & MAY_READ) r = 1;
 	if (desired & MAY_WRITE) w = 1;
 	if (desired & MAY_EXEC) x = 1;
-	name = inode_name(ino);
-	if (name == NULL)
-		return -ENOMEM;
-
-	if (S_ISCHR(ino->i_mode) || S_ISBLK(ino->i_mode) ||
-	    S_ISFIFO(ino->i_mode) || S_ISSOCK(ino->i_mode))
-		err = 0;
-	else
-		err = access_file(name, r, w, x);
-	__putname(name);
-	if (!err)
-		err = generic_permission(&nop_mnt_idmap, ino, desired);
+	/*
+	 * The permission check must be the guest's, not the host access(2)
+	 * result: the hosting process owns the tree and the guest sees the
+	 * host uid/gid through vcred, so a host access() call rejects what the
+	 * guest is entitled to. overlayfs itself relies on this when it creates
+	 * its work directory with mode 0 and keeps operating inside it.
+	 * The real policy is still enforced by the host kernel on each
+	 * forwarded operation, which fails with the host's own EACCES.
+	 */
+	(void) r;
+	(void) w;
+	(void) x;
+	err = generic_permission(&nop_mnt_idmap, ino, desired);
 	return err;
 }
 
@@ -825,14 +1104,25 @@ static int hostfs_setattr(struct mnt_idmap *idmap,
 	if (attr->ia_valid & ATTR_MODE) {
 		attrs.ia_valid |= HOSTFS_ATTR_MODE;
 		attrs.ia_mode = attr->ia_mode;
+		/* A directory without owner rwx cannot be entered by the host
+		 * process that performs every hostfs operation, so overlayfs
+		 * could not use it as its work directory (it creates it with
+		 * mode 0 on purpose and relies on CAP_DAC_OVERRIDE, which an
+		 * unprivileged container does not have). Keep owner rwx. */
+		if (S_ISDIR(inode->i_mode))
+			attrs.ia_mode |= S_IRWXU;
 	}
 	if (attr->ia_valid & ATTR_UID) {
 		attrs.ia_valid |= HOSTFS_ATTR_UID;
 		attrs.ia_uid = from_kuid(&init_user_ns, attr->ia_uid);
+		if (attrs.ia_uid == 0)
+			attrs.ia_uid = hostfs_host_uid();
 	}
 	if (attr->ia_valid & ATTR_GID) {
 		attrs.ia_valid |= HOSTFS_ATTR_GID;
 		attrs.ia_gid = from_kgid(&init_user_ns, attr->ia_gid);
+		if (attrs.ia_gid == 0)
+			attrs.ia_gid = hostfs_host_gid();
 	}
 	if (attr->ia_valid & ATTR_SIZE) {
 		attrs.ia_valid |= HOSTFS_ATTR_SIZE;
@@ -876,9 +1166,120 @@ static int hostfs_setattr(struct mnt_idmap *idmap,
 	return 0;
 }
 
+/*
+ * Extended attributes: straight passthrough to the host l*xattr calls.
+ *
+ * overlayfs needs at least one of (trusted|user).overlay.* xattr or
+ * RENAME_WHITEOUT to place whiteouts in its upper layer. The pod kboxd runs in
+ * has no CAP_SYS_ADMIN on the host, so trusted.* fails with EPERM and overlayfs
+ * must be mounted with the "userxattr" option; user.* is then set by the
+ * unprivileged uid that owns the corpus. Both namespaces are forwarded here
+ * unchanged, and the host kernel decides.
+ */
+static int hostfs_xattr_get(const struct xattr_handler *handler,
+			    struct dentry *dentry, struct inode *inode,
+			    const char *suffix, void *value, size_t size)
+{
+	const char *name = xattr_full_name(handler, suffix);
+	char *path;
+	int err;
+
+	if (HOSTFS_I(inode)->fd != -1)
+		return hostfs_fgetxattr(HOSTFS_I(inode)->fd, name, value, size);
+
+	path = dentry_name(dentry);
+	if (path == NULL)
+		return -ENOMEM;
+	err = hostfs_getxattr(path, name, value, size);
+	__putname(path);
+	return err;
+}
+
+static int hostfs_xattr_set(const struct xattr_handler *handler,
+			    struct mnt_idmap *idmap, struct dentry *dentry,
+			    struct inode *inode, const char *suffix,
+			    const void *value, size_t size, int flags)
+{
+	const char *name = xattr_full_name(handler, suffix);
+	char *path;
+	int err;
+
+	path = dentry_name(dentry);
+	if (path == NULL)
+		return -ENOMEM;
+	if (HOSTFS_I(inode)->fd != -1) {
+		if (value == NULL)
+			err = hostfs_fremovexattr(HOSTFS_I(inode)->fd, name);
+		else
+			err = hostfs_fsetxattr(HOSTFS_I(inode)->fd, name, value,
+					       size, flags);
+		__putname(path);
+		return err;
+	}
+
+	if (value == NULL)
+		err = hostfs_removexattr(path, name);
+	else
+		err = hostfs_setxattr(path, name, value, size, flags);
+	__putname(path);
+	return err;
+}
+
+static ssize_t hostfs_do_listxattr(struct dentry *dentry, char *list,
+				   size_t size)
+{
+	struct inode *inode = d_inode(dentry);
+	char *path;
+	int err;
+
+	if (HOSTFS_I(inode)->fd != -1)
+		return hostfs_flistxattr(HOSTFS_I(inode)->fd, list, size);
+
+	path = dentry_name(dentry);
+	if (path == NULL)
+		return -ENOMEM;
+	err = hostfs_listxattr(path, list, size);
+	__putname(path);
+	return err;
+}
+
+static const struct xattr_handler hostfs_xattr_user = {
+	.prefix = XATTR_USER_PREFIX,
+	.get	= hostfs_xattr_get,
+	.set	= hostfs_xattr_set,
+};
+
+static const struct xattr_handler hostfs_xattr_trusted = {
+	.prefix = XATTR_TRUSTED_PREFIX,
+	.get	= hostfs_xattr_get,
+	.set	= hostfs_xattr_set,
+};
+
+static const struct xattr_handler hostfs_xattr_security = {
+	.prefix = XATTR_SECURITY_PREFIX,
+	.get	= hostfs_xattr_get,
+	.set	= hostfs_xattr_set,
+};
+
+static const struct xattr_handler hostfs_xattr_system = {
+	.prefix = XATTR_SYSTEM_PREFIX,
+	.get	= hostfs_xattr_get,
+	.set	= hostfs_xattr_set,
+};
+
+static const struct xattr_handler *const hostfs_xattr_handlers[] = {
+	&hostfs_xattr_user,
+	&hostfs_xattr_trusted,
+	&hostfs_xattr_security,
+	&hostfs_xattr_system,
+	NULL,
+};
+
 static const struct inode_operations hostfs_iops = {
+	.getattr	= hostfs_getattr,
 	.permission	= hostfs_permission,
 	.setattr	= hostfs_setattr,
+	.listxattr	= hostfs_do_listxattr,
 };
 
 static const struct inode_operations hostfs_dir_iops = {
@@ -893,6 +1294,8 @@ static const struct inode_operations hostfs_dir_iops = {
 	.rename		= hostfs_rename2,
 	.permission	= hostfs_permission,
 	.setattr	= hostfs_setattr,
+	.listxattr	= hostfs_do_listxattr,
+	.tmpfile	= hostfs_tmpfile,
 };
 
 static const char *hostfs_get_link(struct dentry *dentry,
@@ -926,6 +1329,7 @@ static const char *hostfs_get_link(struct dentry *dentry,
 
 static const struct inode_operations hostfs_link_iops = {
 	.get_link	= hostfs_get_link,
+	.listxattr	= hostfs_do_listxattr,
 };
 
 static int hostfs_fill_super(struct super_block *sb, struct fs_context *fc)
@@ -938,6 +1342,7 @@ static int hostfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	sb->s_blocksize_bits = 10;
 	sb->s_magic = HOSTFS_SUPER_MAGIC;
 	sb->s_op = &hostfs_sbops;
+	sb->s_xattr = hostfs_xattr_handlers;
 	sb->s_d_op = &simple_dentry_operations;
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	err = super_setup_bdi(sb);
@@ -1012,6 +1417,11 @@ static int hostfs_parse_monolithic(struct fs_context *fc, void *data)
 	/* NULL is printed as '(null)' by printf(): avoid that. */
 	if (host_root == NULL)
 		host_root = "";
+
+	/* Accept both the UML form ("-o /path/on/host") and the keyed form
+	 * used by kbox ("-o hostfs=/path/on/host"). */
+	if (strncmp(host_root, "hostfs=", 7) == 0)
+		host_root += 7;
 
 	fsi->host_root_path =
 		kasprintf(GFP_KERNEL, "%s/%s", root_ino, host_root);

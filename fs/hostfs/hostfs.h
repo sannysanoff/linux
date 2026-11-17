@@ -2,7 +2,14 @@
 #ifndef __UM_FS_HOSTFS
 #define __UM_FS_HOSTFS
 
-#include <os.h>
+/*
+ * LKL builds hostfs without the UML shared os.h. uid_t/gid_t come from the
+ * libc headers on the user side and from the kernel headers on the kernel
+ * side, both of which are included before this file.
+ */
+#ifndef __KERNEL__
+#include <sys/types.h>
+#endif
 
 /*
  * These are exactly the same definitions as in fs.h, but the names are
@@ -97,6 +104,29 @@ extern int link_file(const char *to, const char *from);
 extern int hostfs_do_readlink(char *file, char *buf, int size);
 extern int rename_file(char *from, char *to);
 extern int rename2_file(char *from, char *to, unsigned int flags);
+extern int hostfs_getxattr(const char *path, const char *name, void *value,
+			   size_t size);
+extern int hostfs_setxattr(const char *path, const char *name,
+			   const void *value, size_t size, int flags);
+extern int hostfs_listxattr(const char *path, char *list, size_t size);
+extern int hostfs_removexattr(const char *path, const char *name);
+extern int hostfs_fgetxattr(int fd, const char *name, void *value, size_t size);
+extern int hostfs_fsetxattr(int fd, const char *name, const void *value,
+			    size_t size, int flags);
+extern int hostfs_flistxattr(int fd, char *list, size_t size);
+extern int hostfs_fremovexattr(int fd, const char *name);
+extern int hostfs_fallocate(int fd, int mode, long long offset, long long len);
+extern long long hostfs_copy_range(int fd_in, long long *off_in, int fd_out,
+				   long long *off_out, unsigned long long len,
+				   unsigned int flags);
+extern int hostfs_tmpfile_open(const char *dir, int mode);
+extern int hostfs_link_fd(int fd, const char *target);
+extern int hostfs_whiteout_create(const char *path);
+extern unsigned hostfs_host_uid(void);
+extern unsigned hostfs_host_gid(void);
+extern unsigned hostfs_guest_uid(unsigned host_uid);
+extern unsigned hostfs_guest_gid(unsigned host_gid);
+extern int hostfs_is_whiteout(const char *path);
 extern int do_statfs(char *root, long *bsize_out, long long *blocks_out,
 		     long long *bfree_out, long long *bavail_out,
 		     long long *files_out, long long *ffree_out,

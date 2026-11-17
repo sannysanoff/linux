@@ -196,3 +196,17 @@ config LKL_HOST_MEMMOVE
 	help
 	  Set to "y" if LKL should call the host memmove hook instead of
 	  performing memory moves manually.
+
+config HOSTFS
+	bool "Host filesystem"
+	help
+	  Export a host directory as a filesystem inside the LKL guest. The
+	  kernel-side file operations are implemented with plain libc calls in
+	  the process that hosts the kernel, so every read, directory listing and
+	  attribute lookup lands on the host filesystem without a copy.
+
+	  mount -t hostfs none /mnt -o hostfs=/path/on/host
+
+	  The path is resolved relative to the process root. Requires a
+	  cooperative host: the guest sees the host's real permissions and
+	  ownership, so mount only directories the guest is allowed to touch.
